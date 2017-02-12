@@ -1,13 +1,12 @@
-// include the GSM library
 #include <HardwareSerial.h>
+#include <EEPROM.h>
 
-//char buffer[100]; // WHAT WE ARE READING INTO
- 
- String buffer;
- 
+char buffer[100]; // WHAT WE ARE READING INTO
 byte pos = 0;  //WHAT POSITION WE ARE AT IN THAT BUFFER
 
 char sendernumber[20];
+
+byte eepromPos = 1;
 
 enum _state 
 {
@@ -16,14 +15,17 @@ enum _state
   SMS_TEXT,
   GSM_LOCATION,
   GPS_LOCATION,
+  GPS_WAIT_FIX,
 };
 
 byte state = IDLESTATE;
-boolean getGSM = false;
-boolean getGPS = false;
+boolean getGpsFix = false;
 
-//BASICALLY TO RESET THE BUFFER
+//For awaiting GPS Fix
+unsigned long previousMillis = 0;
+const long interval = 5000; //check every 5 seconds
 
+//Reset the buffer
 void resetBuffer() 
 {
   memset(buffer, 0, sizeof(buffer));
@@ -31,44 +33,50 @@ void resetBuffer()
 }
 
 void setup() {
+  //Builtin LED off while initializing
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+  
   //Begin serial comunication with Arduino and Arduino IDE (Serial Monitor)
   Serial.begin(9600);
   while(!Serial);
    
-  //Begin serial communication with Arduino and SIM800
+  //Begin serial communication with Arduino and SIM808
   Serial1.begin(9600);
   while(!Serial1);
   
-  // Setup GSM
- 
-  Serial1.print("AT+SAPBR=3,1,\"CONTYPE\",\"GPRS\"\r\n");
-  delay(500);
-  Serial1.print("AT+SAPBR=3,1,\"APN\",\"internet\"\r\n");
-  delay(500);
-  Serial1.print("AT+SAPBR=1,1\r\n");  
-  delay(500);
+  //Turn command echo off
+  Serial1.write("ATE0\r\n");
+  
   //Set SMS format to ASCII
   Serial1.write("AT+CMGF=1\r\n");
-  delay(500);
-  //Turn off echo
-  Serial1.write("ATE0\r\n");
-  delay(500);
+
   //Enable serial notification on sms arrival
   Serial1.print("AT+CNMI=1,2,0,0,0\r\n");
   
   delay(1000); // Make sure commands are processed
   
-  flushSIM800();
-  
-  resetBuffer();
-  
-  Serial.println("Setup Complete!");
+  // LED on when initializing finished
+  digitalWrite(LED_BUILTIN, HIGH);
 }
 
 void loop() {
   
   if (Serial1.available()) {
     interpret(Serial1.read());
+  }
+  
+  //If waiting for GPS fix, check every 5 seconds
+  if(getGpsFix == true) {
+    unsigned long currentMillis = millis();
+    
+    if (currentMillis - previousMillis >= interval) {
+      // save the last time
+      previousMillis = currentMillis;
+      //Check GPS Status
+      Serial1.print("AT+CGPSSTATUS?\r\n");
+      Serial.println("Checking if GPS is available");
+    }
   }
   
 }
@@ -78,7 +86,7 @@ void interpret (byte b) {
 
   switch(state) {
     case IDLESTATE:
-      // remove leading newlines
+      // remove leading newlines and throw away messages that cannot be interpreted
       if ( b == '\n' ) {
         resetBuffer();
       }
@@ -103,9 +111,21 @@ void interpret (byte b) {
         state = GPS_LOCATION; 
         resetBuffer();
       }
-      else if (strcmp(buffer, "UNDER-VOLTAGE WARNNING") == 0 )
+      else if (strcmp(buffer, "+CGPSSTATUS: ") == 0 )
       { 
-      //  sendSMS
+        state = GPS_WAIT_FIX;
+        resetBuffer();
+      }
+      else if (strncmp(buffer, "UNDER-VOLTAGE", 13) == 0 )
+      { 
+        String number;
+        int i=0;
+        do {
+          number += (char)EEPROM.read(i++);
+        } while((char)EEPROM.read(i) != 'A');
+        number += '"';
+        sendSMS("Battery voltage low", number);
+        bufferReset();
       }
       break;
     case SMS_RECEIVED:
@@ -113,11 +133,8 @@ void interpret (byte b) {
         
         char *p = strtok(buffer, ",");
         strcpy(sendernumber, p);
-       // Serial.print("sendernumber: ");
-       // Serial.println(sendernumber);
         
         resetBuffer();
-        
         state = SMS_TEXT;
         }
       break;
@@ -127,13 +144,22 @@ void interpret (byte b) {
         Serial.println(buffer);
         
         if (strncmp(buffer, "GPS", 3) == 0) {
-          getGPSLocation();
+          //enable GPS
+          Serial1.print("AT+CGPSPWR=1\r\n");
+          getGpsFix = true;
         }        
         else if (strncmp(buffer, "GSM", 3) == 0) {
           getGSMLocation();
         }
+        else if (strncmp(buffer, "REGISTER", 8) == 0) {
+          int i = 0;
+          do {
+            EEPROM.write(i, sendernumber[i]);
+          } while(sendernumber[++i] != '"');
+          EEPROM.write(i, 'A'); //termination
+        }
         else {
-          sendSMS("Unknown command", sendernumber);  
+          sendSMS("Unknown command. Valid commands are: GSM, GPS, REGISTER", sendernumber);  
         }
         
         state = IDLESTATE;
@@ -162,23 +188,18 @@ void interpret (byte b) {
       case GPS_LOCATION:
       if(b == '\n') {
         Serial.println(buffer);
-        
-        //Interpret return of AT-command
+      //Interpret return of AT-command
         char *p = strtok(buffer, ",");  //Discard the first part
-        char *lon = strtok(NULL, ",");  //Second part is the longitude
-        char *lat = strtok(NULL, ",");  //Third part is the latitude
+        p = strtok(NULL, ",");          //Discard the second part
+        char *lat = strtok(NULL, ",");  //Third part is the longitude
+        p = strtok(NULL, ",");          //Discard the fourth part
+        char *lon = strtok(NULL, ",");  //Fifth part is the latitude
         
-        
-        String str;
-        
-        str.concat("google.de/maps/place/");
-        str.concat(lon[0);
-        //strcat(str, test.substring(0,1));
-     //   strcat(str, "°");
-        
-     //   strcat(str, lat);
-     //   strcat(str, ",");
-     //   strcat(str, lon);
+        char str[160];
+        strcpy(str, "google.de/maps/place/");
+        strcat(str, lat);
+        strcat(str, ",");
+        strcat(str, lon);
         
         sendSMS(str, sendernumber);
         
@@ -186,6 +207,19 @@ void interpret (byte b) {
         resetBuffer();
       }
       break;
+    case GPS_WAIT_FIX:
+      if(b == '\n') {
+        if (strncmp(buffer, "Location 3D Fix", 15) == 0) {
+          //Get GPS-Location
+          Serial1.print("AT+CGPSINF=2\r\n");
+          getGpsFix = false;
+          resetBuffer();
+          
+          Serial.println("GPS available!!!");
+        }
+        state = IDLESTATE;
+      }
+    break;
   }
 }
 
@@ -212,19 +246,6 @@ void sendATCommand(String command) {
   //flush buffer
   while(Serial1.available())
     Serial1.read();
-}
-
-void flushSIM800() {
-  while(Serial1.available())
-       Serial1.read();
-}
-
-void getGPSLocation () {
-  //enable GPS
-  Serial1.print("AT+CGPSPWR=1\r\n");
-  
-  Serial1.print("AT+CGPSINF=0\r\n");
-  //checkGPSFix = 1;
 }
 
 void getGSMLocation () {
